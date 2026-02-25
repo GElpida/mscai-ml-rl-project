@@ -16,12 +16,23 @@ AgentType = str  # "X" (column player) or "Y" (row player)
 
 
 # -----------------------------
-# Payoff matrix (row, col)
-# Given table:
+# Payoff matrices (row, col)
+# We encode actions as 0=1 and 1=2
+#
+# X-Y interactions (Y is row, X is col):
 #         Col1   Col2
 # Row1    1,2    1,1
 # Row2    1,1    2,1
-# We encode actions as 0=1 and 1=2
+#
+# X-X interactions:
+#         Col1   Col2
+# Row1    2,2    1,1
+# Row2    1,1    1,1
+#
+# Y-Y interactions:
+#         Col1   Col2
+# Row1    1,1    1,1
+# Row2    1,1    2,2
 # -----------------------------
 def payoff(row_action: Action, col_action: Action) -> Tuple[float, float]:
     """Returns (row_reward, col_reward)."""
@@ -33,6 +44,32 @@ def payoff(row_action: Action, col_action: Action) -> Tuple[float, float]:
         return (1.0, 1.0)
     if row_action == 1 and col_action == 1:
         return (2.0, 1.0)
+    raise ValueError(f"Invalid actions: row={row_action}, col={col_action}")
+
+
+def payoff_xx(row_action: Action, col_action: Action) -> Tuple[float, float]:
+    """Returns (row_reward, col_reward) for X-X interactions."""
+    if row_action == 0 and col_action == 0:
+        return (2.0, 2.0)
+    if row_action == 0 and col_action == 1:
+        return (1.0, 1.0)
+    if row_action == 1 and col_action == 0:
+        return (1.0, 1.0)
+    if row_action == 1 and col_action == 1:
+        return (1.0, 1.0)
+    raise ValueError(f"Invalid actions: row={row_action}, col={col_action}")
+
+
+def payoff_yy(row_action: Action, col_action: Action) -> Tuple[float, float]:
+    """Returns (row_reward, col_reward) for Y-Y interactions."""
+    if row_action == 0 and col_action == 0:
+        return (1.0, 1.0)
+    if row_action == 0 and col_action == 1:
+        return (1.0, 1.0)
+    if row_action == 1 and col_action == 0:
+        return (1.0, 1.0)
+    if row_action == 1 and col_action == 1:
+        return (2.0, 2.0)
     raise ValueError(f"Invalid actions: row={row_action}, col={col_action}")
 
 
@@ -68,15 +105,23 @@ def default_agent_types_7() -> List[AgentType]:
 
 
 def default_adjacency_7() -> Dict[AgentId, List[AgentId]]:
-    # From the graph image (undirected edges shown as plain lines)
+    # Undirected edges (both directions implied via `undirected=True`):
+    # X1—Y1
+    # Y1—X4
+    # Y1—X3
+    # X4—X3
+    # X3—Y2
+    # X3—X5
+    # X5—Y2
+    # X2—Y2
     return {
-        0: [2],        # X1 — Y1
-        1: [3],        # X2 — Y2
-        2: [0, 4, 5],  # Y1 — X1, X3, X4
-        3: [1, 4],     # Y2 — X2, X3
-        4: [2, 3, 6],  # X3 — Y1, Y2, X5
-        5: [2],        # X4 — Y1
-        6: [4],        # X5 — X3
+        0: [2],           # X1 — Y1
+        1: [3],           # X2 — Y2
+        2: [0, 4, 5],     # Y1 — X1, X3, X4
+        3: [1, 4, 6],     # Y2 — X2, X3, X5
+        4: [2, 3, 5, 6],  # X3 — Y1, Y2, X4, X5
+        5: [2, 4],        # X4 — Y1, X3
+        6: [3, 4],        # X5 — Y2, X3
     }
 
 
@@ -136,26 +181,19 @@ class CoordinationGame:
         ti = self.agent_types[i]
         tj = self.agent_types[j]
         
-        #if X-X agents no reward
-        if ti == tj:
-            return (0.0, 0.0)
+        if ti == "X" and tj == "X":
+            return payoff_xx(ai, aj)
+        if ti == "Y" and tj == "Y":
+            return payoff_yy(ai, aj)
 
         # Y is row, X is col
         if ti == "Y" and tj == "X":
-            row_r, col_r = payoff(ai, aj)
-            return row_r, col_r
+            return payoff(ai, aj)
         if ti == "X" and tj == "Y":
             row_r, col_r = payoff(aj, ai)
             return col_r, row_r
 
-        # Same-type edge exists in your graph (X3—X5). Deterministic fallback:
-        # smaller index acts as row, larger as col
-        if i < j:
-            row_r, col_r = payoff(ai, aj)
-            return row_r, col_r
-        else:
-            row_r, col_r = payoff(aj, ai)
-            return col_r, row_r
+        raise ValueError(f"Invalid agent types on edge ({i},{j}): {ti}-{tj}")
 
 
 def make_default_game_7() -> CoordinationGame:
