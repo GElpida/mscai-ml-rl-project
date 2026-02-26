@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # allow imports from parent dir if needed
+import os
+import sys
 
 # Avoid permission issues with __pycache__ writes in this repo.
 sys.dont_write_bytecode = True
+
+# allow imports from project root
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +15,10 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 
-from agents.agent_Qblind import QLearningAgent
+from agents.agent_Qneighbors import QLearningNeighborAgent
 from game.coordination_repeated_game import make_default_game_7
 
 Action = int
-# IMPORTANT: this main assumes your blind state is (last_action, agent_type)
-# If your agent uses a different state tuple, adjust build_state() below accordingly.
 State = Tuple
 
 
@@ -29,14 +30,14 @@ class RunConfig:
     alpha: float = 0.1
     gamma: float = 0.95
 
-    # ε starts at 1, drops by 0.01 every 40 episodes
+    # epsilon starts at 1, drops by 0.01 every 40 episodes
     eps_start: float = 1.0
     eps_drop: float = 0.01
     eps_drop_every: int = 40
 
-    # outputs
-    out_prefix: str = "blind"
-    out_dir: str = r"results\Q_blind"
+    # outputs (relative to repo root)
+    out_prefix: str = "neighbors"
+    out_dir: str = r"results\Q_neighbors"
 
     # GIF
     gif_every: int = 50  # frame every N episodes (exploration phase)
@@ -104,38 +105,33 @@ def expected_reward_for_agent_mixed(game, i: int, pi0: float, p_action1: List[fl
 
 
 # -------------------------
-# State builder (OWN-ONLY info)
+# Training loop (neighbors observable)
 # -------------------------
-def build_state(last_action_i: Action, agent_type_i: str) -> State:
-    # Blind to others, but not blind to self: own last action + own type
-    return (last_action_i, agent_type_i)
-
-
-# -------------------------
-# Training loop
-# -------------------------
-def run_blind(cfg: RunConfig):
+def run_neighbors(cfg: RunConfig):
     game = make_default_game_7()
     out_dir = ensure_outdir(cfg)
 
-    agents: List[QLearningAgent] = [
-        QLearningAgent(i, game.agent_types[i], alpha=cfg.alpha, gamma=cfg.gamma)
+    agents: List[QLearningNeighborAgent] = [
+        QLearningNeighborAgent(
+            agent_id=i,
+            agent_type=game.agent_types[i],
+            neighbors=game.adjacency[i],
+            alpha=cfg.alpha,
+            gamma=cfg.gamma,
+        )
         for i in range(game.n_agents)
     ]
 
-    # own-only memory
-    last_action: List[Action] = [0] * game.n_agents
+    # global last-actions memory (used to build each agent's local observation)
+    last_actions: List[Action] = [0] * game.n_agents
 
-    # Track a few agents for Q plots (purely for reporting/plots)
     tracked_ids = {"X1": 0, "Y1": 2, "X3": 4}
     q_hist: Dict[str, List[Tuple[float, float]]] = {k: [] for k in tracked_ids}
 
-    # counts by type
     cnt_by_type = {"X": 0, "Y": 0}
     for typ in game.agent_types:
         cnt_by_type[typ] += 1
 
-    # --- Episode metrics ---
     avg_reward_ep_all: List[float] = []
     avg_reward_ep_type: Dict[str, List[float]] = {"X": [], "Y": []}
 
@@ -149,14 +145,10 @@ def run_blind(cfg: RunConfig):
 
     disc_return_by_type: Dict[str, List[float]] = {"X": [], "Y": []}
 
-    # per-timestep mean reward by type
     sum_r_by_type_t = {"X": [0.0] * cfg.horizon, "Y": [0.0] * cfg.horizon}
 
-    # for exploitability: empirical mixed strategy each episode
     p_action2_hist: List[List[float]] = []
-
-    # GIF frames: (episode, last-round action profile list)
-    gif_frames_data: List[Tuple[int, List[int]]] = []
+    gif_frames_data: List[Tuple[int, List[int]]] = []  # (episode, last-round action profile)
     gif_durations: List[float] = []
 
     for ep in range(cfg.episodes):
@@ -169,72 +161,59 @@ def run_blind(cfg: RunConfig):
         action2_counts = [0] * game.n_agents
         last_actions_profile: List[Action] = [0] * game.n_agents
 
-        # OPTION 2: store each tracked agent's *actual* state at the start of episode
         start_state_for_tracked: Dict[str, State] = {}
 
         for t in range(cfg.horizon):
-            # build current states (own-only)
-            states: List[State] = [
-                build_state(last_action[i], game.agent_types[i])
-                for i in range(game.n_agents)
-            ]
+            states: List[State] = [agents[i].build_state(last_actions) for i in range(game.n_agents)]
 
-            # capture states at t==0 for Q plotting (Option 2)
             if t == 0:
                 for name, aid in tracked_ids.items():
                     start_state_for_tracked[name] = states[aid]
 
-            # actions
             actions: List[Action] = [agents[i].select_action(states[i], eps) for i in range(game.n_agents)]
             rewards: List[float] = game.step(actions)
             last_actions_profile = actions
 
-            # count action2
             for i, a in enumerate(actions):
                 if a == 1:
                     action2_counts[i] += 1
 
-            # Q update + discounted returns
-            discount = (cfg.gamma ** t)
+            discount = (cfg.gamma**t)
             for i, ag in enumerate(agents):
-                next_state = build_state(actions[i], game.agent_types[i])
+                next_state = ag.build_state(actions)
                 ag.update(states[i], actions[i], rewards[i], next_state)
 
                 disc_returns[i] += discount * rewards[i]
-                last_action[i] = actions[i]
+                last_actions[i] = actions[i]
 
-            # average reward accumulators
             ep_total_reward += sum(rewards)
             for i, r in enumerate(rewards):
                 typ = game.agent_types[i]
                 ep_reward_by_type[typ] += r
                 sum_r_by_type_t[typ][t] += r
 
-            # regret (external regret vs best fixed action in hindsight)
             for i in range(game.n_agents):
                 r_actual = rewards[i]
                 r0 = realized_reward_for_agent(game, i, 0, actions)
                 r1 = realized_reward_for_agent(game, i, 1, actions)
                 ep_regret_by_agent[i] += max(r0, r1) - r_actual
 
-        # store policy frequencies
         p_action2 = [c / cfg.horizon for c in action2_counts]
         p_action2_hist.append(p_action2)
 
-        # avg reward per episode (mean per agent per step)
         avg_all = ep_total_reward / (game.n_agents * cfg.horizon)
         avg_reward_ep_all.append(avg_all)
         for typ in ("X", "Y"):
             avg_reward_ep_type[typ].append(ep_reward_by_type[typ] / (cnt_by_type[typ] * cfg.horizon))
 
-        # regret per episode (mean per agent per step)
         regret_all = sum(ep_regret_by_agent) / (game.n_agents * cfg.horizon)
         regret_ep_all.append(regret_all)
         for typ in ("X", "Y"):
             typ_ids = [i for i, t in enumerate(game.agent_types) if t == typ]
-            regret_ep_type[typ].append(sum(ep_regret_by_agent[i] for i in typ_ids) / (cnt_by_type[typ] * cfg.horizon))
+            regret_ep_type[typ].append(
+                sum(ep_regret_by_agent[i] for i in typ_ids) / (cnt_by_type[typ] * cfg.horizon)
+            )
 
-        # exploitability + NashConv from empirical mixed strategies
         p_action1 = [1.0 - p2 for p2 in p_action2]
         exploit_i = [0.0] * game.n_agents
         for i in range(game.n_agents):
@@ -252,7 +231,6 @@ def run_blind(cfg: RunConfig):
             typ_ids = [i for i, t in enumerate(game.agent_types) if t == typ]
             exploit_ep_mean_type[typ].append(sum(exploit_i[i] for i in typ_ids) / cnt_by_type[typ])
 
-        # discounted return per episode per type
         disc_return_by_type["X"].append(
             sum(disc_returns[i] for i, t in enumerate(game.agent_types) if t == "X") / cnt_by_type["X"]
         )
@@ -260,7 +238,6 @@ def run_blind(cfg: RunConfig):
             sum(disc_returns[i] for i, t in enumerate(game.agent_types) if t == "Y") / cnt_by_type["Y"]
         )
 
-        # Q snapshot (Option 2): use the REAL start-of-episode state for each tracked agent
         for name, aid in tracked_ids.items():
             s_plot = start_state_for_tracked.get(name)
             q = agents[aid].Q.get(s_plot, [0.0, 0.0])
@@ -312,40 +289,34 @@ def run_blind(cfg: RunConfig):
     }
 
 
-# -------------------------
-# Plots + Network GIF
-# -------------------------
 def plot_results(results: dict, cfg: RunConfig):
     out_dir = ensure_outdir(cfg)
     p = cfg.out_prefix
 
-    # Q-values per episode for tracked agents (now meaningful)
     for name, series in results["q_hist"].items():
         q0 = [x[0] for x in series]
         q1 = [x[1] for x in series]
         plt.figure()
         plt.plot(q0, label="Q(action 1)")
         plt.plot(q1, label="Q(action 2)")
-        plt.title(f"{name}: Q-values per episode (blind, actual state)")
+        plt.title(f"{name}: Q-values per episode (neighbors observable)")
         plt.xlabel("Episode")
         plt.ylabel("Q")
         plt.legend()
         save_fig(out_dir, f"{p}_{name}_qvalues.png")
 
-    # Mean reward per timestep by type
     for typ, vals in results["mean_r_by_type_t"].items():
         plt.figure()
         plt.plot(vals)
-        plt.title(f"Mean reward per timestep for type {typ} (blind)")
+        plt.title(f"Mean reward per timestep for type {typ} (neighbors)")
         plt.xlabel("Timestep")
         plt.ylabel("Mean reward")
         save_fig(out_dir, f"{p}_mean_reward_type_{typ}.png")
 
-    # Discounted return per episode by type
     for typ, vals in results["disc_return_by_type"].items():
         plt.figure()
         plt.plot(vals)
-        plt.title(f"Mean discounted return per episode for type {typ} (blind)")
+        plt.title(f"Mean discounted return per episode for type {typ} (neighbors)")
         plt.xlabel("Episode")
         plt.ylabel("Discounted return")
         save_fig(out_dir, f"{p}_disc_return_type_{typ}.png")
@@ -365,7 +336,6 @@ def plot_results(results: dict, cfg: RunConfig):
     plt.ylabel("Avg reward")
     save_fig(out_dir, f"{p}_avg_reward_per_episode_type_Y.png")
 
-    # Regret per episode
     plt.figure()
     plt.plot(results["regret_ep_all"], label="All agents")
     plt.plot(results["regret_ep_type"]["X"], label="Type X")
@@ -376,7 +346,6 @@ def plot_results(results: dict, cfg: RunConfig):
     plt.legend()
     save_fig(out_dir, f"{p}_regret_per_episode.png")
 
-    # Exploitability per episode
     plt.figure()
     plt.plot(results["exploit_ep_mean_all"], label="All agents")
     plt.plot(results["exploit_ep_mean_type"]["X"], label="Type X")
@@ -387,7 +356,6 @@ def plot_results(results: dict, cfg: RunConfig):
     plt.legend()
     save_fig(out_dir, f"{p}_exploitability_per_episode.png")
 
-    # NashConv per episode
     plt.figure()
     plt.plot(results["nashconv_ep"])
     plt.title("NashConv per episode (sum of best-response gains)")
@@ -401,8 +369,8 @@ def make_network_gif(results: dict, cfg: RunConfig):
     gif_path = out_dir / f"{cfg.out_prefix}_network.gif"
 
     try:
-        import networkx as nx
         import imageio.v2 as imageio
+        import networkx as nx
     except Exception:
         print("Missing dependency: install networkx + imageio to make the GIF.")
         return
@@ -456,7 +424,7 @@ def make_network_gif(results: dict, cfg: RunConfig):
             vmax=1,
         )
         nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=9, font_color="black")
-        plt.title(f"Blind {phase}: node color = last action | episode {ep_idx}")
+        plt.title(f"Neighbors {phase}: node color = last action | episode {ep_idx}")
         fig = plt.gcf()
         fig.legend(
             handles=legend_handles,
@@ -470,6 +438,7 @@ def make_network_gif(results: dict, cfg: RunConfig):
         plt.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
 
         import io
+
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         plt.close()
@@ -483,7 +452,7 @@ def make_network_gif(results: dict, cfg: RunConfig):
 
 def main():
     cfg = RunConfig()
-    results = run_blind(cfg)
+    results = run_neighbors(cfg)
     plot_results(results, cfg)
     make_network_gif(results, cfg)
     print("Done. Saved all outputs in:", results["out_dir"])
